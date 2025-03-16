@@ -1834,30 +1834,21 @@ object ZPipeline extends ZPipelinePlatformSpecificConstructors {
   def mapZIOChunked[Env, Err, In, Out](
     f: In => ZIO[Env, Err, Out]
   )(implicit trace: Trace): ZPipeline[Env, Err, In, Out] = {
-    def writeWithNext(
-      builder: ChunkBuilder[Out],
-      next: => ZChannel[Env, Err, Chunk[In], Any, Err, Chunk[Out], Any]
-    ): ZChannel[Env, Err, Chunk[In], Any, Err, Chunk[Out], Any] = {
-      val out = builder.result()
-      if (out.nonEmpty) ZChannel.write(out) *> next else next
+    ZPipeline.chunks.mapStream { (chunk: Chunk[In]) =>
+      val builder = ChunkBuilder.make[Out](chunk.size)
+      def writeNonEmpty = {
+        val out = builder.result()
+        ZStream.when(out.nonEmpty)(ZStream.fromChunk(out))
+      }
+      ZStream.unwrap {
+        chunk
+          .mapZIODiscard(f(_).map(builder += _))
+          .foldCause(
+            cause => writeNonEmpty ++ ZStream.failCause(cause),
+            _ => writeNonEmpty
+          )
+      }
     }
-
-    lazy val reader: ZChannel[Env, Err, Chunk[In], Any, Err, Chunk[Out], Any] =
-      ZChannel.readWithCause(
-        chunk =>
-          ZChannel.unwrap {
-            val builder = ChunkBuilder.make[Out](chunk.size)
-            chunk
-              .mapZIODiscard(f(_).map(builder += _))
-              .foldCause(
-                cause => writeWithNext(builder, ZChannel.refailCause(cause)),
-                _ => writeWithNext(builder, reader)
-              )
-          },
-        err => ZChannel.refailCause(err),
-        done => ZChannel.succeed(done)
-      )
-    new ZPipeline(reader)
   }
 
   /**
